@@ -139,8 +139,9 @@ impl UdpConnection {
                 }
             }
 
-            // Parse from raw bytes: a SIP body is opaque octets (RFC 3261 §7.4)
-            // and may not be valid UTF-8 (e.g. application/vnd.3gpp.sms).
+            // Parse from raw bytes: a SIP body is opaque octets (RFC 3261 §7.4) and may not
+            // be valid UTF-8 (e.g. application/vnd.3gpp.sms). Gating the whole datagram on
+            // from_utf8 would drop those messages.
             let msg = match crate::sip::SipMessage::try_from(&buf[..len]) {
                 Ok(msg) => msg,
                 Err(e) => {
