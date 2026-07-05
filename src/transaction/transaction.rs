@@ -478,26 +478,38 @@ impl Transaction {
         let mut connection = connection;
         if let Some(resp) = self.last_response.as_ref() {
             if resp.status_code.kind() == StatusCodeKind::Successful {
-                // 2xx response, set destination from request
-                let target = {
-                    let target = ack.destination();
-                    if let Some(locator) = self.endpoint_inner.locator.as_ref() {
-                        Some(locator.locate(&target).await?)
-                    } else {
-                        (&target).try_into().ok()
+                // Reuse the flow the response arrived on: send the 2xx ACK back to the
+                // response source (RFC 7118 §5 / connection-oriented flow reuse, and
+                // symmetric routing for UDP). Otherwise the ACK dials the Record-Route/
+                // Contact target, which is often unreachable from the client — a proxy's
+                // internal address, or (behind a record-routing proxy) the proxy's own
+                // address, looping the ACK back. See restsend/rsipstack#129.
+                let arrival_remote = connection.as_ref().and_then(|c| c.get_remote_addr().cloned());
+                if let Some(remote) = arrival_remote {
+                    self.destination.replace(remote);
+                } else {
+                    // No arrival connection to reuse (e.g. a locally generated response):
+                    // resolve the ACK target as before.
+                    let target = {
+                        let target = ack.destination();
+                        if let Some(locator) = self.endpoint_inner.locator.as_ref() {
+                            Some(locator.locate(&target).await?)
+                        } else {
+                            (&target).try_into().ok()
+                        }
+                    };
+                    if let Some(addr) = target {
+                        let (via_connection, resolved_addr) = self
+                            .endpoint_inner
+                            .transport_layer
+                            .lookup(&addr, Some(&self.key))
+                            .await?;
+                        // For UDP, we need to store the resolved destination address
+                        if !via_connection.is_reliable() {
+                            self.destination.replace(resolved_addr);
+                        }
+                        connection = Some(via_connection);
                     }
-                };
-                if let Some(addr) = target {
-                    let (via_connection, resolved_addr) = self
-                        .endpoint_inner
-                        .transport_layer
-                        .lookup(&addr, Some(&self.key))
-                        .await?;
-                    // For UDP, we need to store the resolved destination address
-                    if !via_connection.is_reliable() {
-                        self.destination.replace(resolved_addr);
-                    }
-                    connection = Some(via_connection);
                 }
             }
         }

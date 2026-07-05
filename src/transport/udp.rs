@@ -139,26 +139,15 @@ impl UdpConnection {
                 }
             }
 
-            let undecoded = match std::str::from_utf8(&buf[..len]) {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!(
-                        src = %addr,
-                        error = %e,
-                        buf = ?&buf[..len],
-                        "decoding text error"
-                    );
-                    continue;
-                }
-            };
-
-            let msg = match crate::sip::SipMessage::try_from(undecoded) {
+            // Parse from raw bytes: a SIP body is opaque octets (RFC 3261 §7.4)
+            // and may not be valid UTF-8 (e.g. application/vnd.3gpp.sms).
+            let msg = match crate::sip::SipMessage::try_from(&buf[..len]) {
                 Ok(msg) => msg,
                 Err(e) => {
                     debug!(
                         src = %addr,
                         error = %e,
-                        raw_message = %undecoded,
+                        buf = ?&buf[..len],
                         "error parsing SIP message"
                     );
                     continue;
@@ -175,14 +164,13 @@ impl UdpConnection {
                     debug!(
                         src = %addr,
                         error = ?e,
-                        raw_message = %undecoded,
                         "error updating SIP via"
                     );
                     continue;
                 }
             };
 
-            debug!(len, src=%addr, dest=%self.get_addr(), raw_message=undecoded, "udp received");
+            debug!(len, src=%addr, dest=%self.get_addr(), raw_message=%msg, "udp received");
 
             let from = SipAddr {
                 r#type: Some(crate::sip::transport::Transport::Udp),

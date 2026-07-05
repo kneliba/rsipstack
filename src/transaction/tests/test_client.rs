@@ -128,6 +128,91 @@ async fn test_client_transaction() -> Result<()> {
     Ok(())
 }
 
+// Regression for #129: a 2xx ACK must reuse the flow the response arrived on, not dial
+// the Record-Route/Contact target (here an unreachable address). Otherwise the ACK never
+// reaches the peer (and on connection-oriented transports blocks on connect).
+#[tokio::test]
+async fn test_2xx_ack_reuses_response_connection() -> Result<()> {
+    let endpoint = super::create_test_endpoint(Some("127.0.0.1:0")).await?;
+    let peer_server = UdpConnection::create_connection("127.0.0.1:0".parse()?, None, None).await?;
+    let peer_addr = peer_server.get_addr().addr.clone();
+
+    let (ack_tx, mut ack_rx) = unbounded_channel::<bool>();
+
+    let peer_server_loop = async {
+        let (sender, mut receiver) = unbounded_channel();
+        select! {
+            _ = async {
+                // 1. Receive the INVITE.
+                let (req, conn) = match receiver.recv().await {
+                    Some(TransportEvent::Incoming(SipMessage::Request(req), conn, _)) => (req, conn),
+                    _ => { assert!(false, "expected INVITE"); return; }
+                };
+                // 2. Reply 200 OK: echo the transaction headers, add a To-tag and an
+                //    UNREACHABLE Contact (the ACK must NOT be sent here).
+                let mut headers = req.headers.clone();
+                headers.retain(|h| !matches!(h, Header::To(_) | Header::Contact(_)));
+                headers.push(To::new("<sip:bob@example.com>;tag=to-tag").into());
+                headers.push(Contact::new("<sip:uas@192.0.2.10:9999>").into());
+                let ok = SipMessage::Response(crate::sip::message::Response {
+                    version: crate::sip::Version::V2,
+                    status_code: crate::sip::StatusCode::OK,
+                    headers,
+                    body: Default::default(),
+                });
+                conn.send(ok, None).await.expect("send 200 OK");
+                // 3. The ACK must arrive back on this flow, not go to 192.0.2.10.
+                match receiver.recv().await {
+                    Some(TransportEvent::Incoming(SipMessage::Request(ack), _, _)) => {
+                        ack_tx.send(ack.method == crate::sip::Method::Ack).ok();
+                    }
+                    _ => { ack_tx.send(false).ok(); }
+                }
+            } => {}
+            _ = peer_server.serve_loop(sender) => { assert!(false, "peer serve_loop exited"); }
+        }
+    };
+
+    let client_loop = async {
+        let invite = crate::sip::message::Request {
+            method: crate::sip::Method::Invite,
+            uri: crate::sip::Uri {
+                scheme: Some(crate::sip::Scheme::Sip),
+                host_with_port: peer_addr.clone(),
+                ..Default::default()
+            },
+            headers: vec![
+                Via::new("SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKinvite1").into(),
+                CSeq::new("1 INVITE").into(),
+                From::new("<sip:alice@example.com>;tag=from-tag").into(),
+                To::new("<sip:bob@example.com>").into(),
+                CallId::new("ack-reuse@example.com").into(),
+                MaxForwards::new("70").into(),
+            ]
+            .into(),
+            version: crate::sip::Version::V2,
+            body: Default::default(),
+        };
+        let key = TransactionKey::from_request(&invite, TransactionRole::Client).expect("key");
+        let mut tx = Transaction::new_client(key, invite, endpoint.inner.clone(), None);
+        tx.send().await.expect("send INVITE");
+        while let Some(_resp) = tx.receive().await {}
+    };
+
+    select! {
+        _ = client_loop => {}
+        _ = peer_server_loop => {}
+        _ = endpoint.serve() => { assert!(false, "endpoint serve exited"); }
+        got_ack = ack_rx.recv() => {
+            assert_eq!(got_ack, Some(true), "peer must receive the ACK over the response flow");
+        }
+        _ = sleep(Duration::from_secs(3)) => {
+            assert!(false, "timeout: ACK never arrived on the flow (dialed Contact instead?)");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_make_ack_uses_contact_and_reversed_route_order() -> Result<()> {
     let endpoint = super::create_test_endpoint(None).await?;
