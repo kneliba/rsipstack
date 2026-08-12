@@ -685,10 +685,9 @@ impl Transaction {
 
         self.transition(new_state).ok();
 
-        // In proxy mode we forward the UAC's own ACK end-to-end rather than generating one
-        // here (which would use the dialog route set — for a record-routing proxy that
-        // includes our own address, looping the ACK back).
-        if is_completed_client_invite && !self.endpoint_inner.option.proxy_mode {
+        
+        let is_2xx = resp.status_code.kind() == StatusCodeKind::Successful;
+        if is_completed_client_invite && (!self.endpoint_inner.option.proxy_mode || !is_2xx) {
             self.send_ack(connection).await.ok();
         }
 
