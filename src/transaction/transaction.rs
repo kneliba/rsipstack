@@ -3,15 +3,19 @@ use super::key::TransactionKey;
 use super::{SipConnection, TransactionState, TransactionTimer, TransactionType};
 use crate::dialog::DialogId;
 use crate::sip::{
-    ContentLength, HasHeaders, Header, HeadersExt, Method, Request, Response, SipMessage,
-    StatusCode, StatusCodeKind,
+    prelude::ToTypedHeader, ContentLength, HasHeaders, Header, HeadersExt, Method, Request,
+    Response, SipMessage, StatusCode, StatusCodeKind, Transport,
 };
 use crate::transaction::key::TransactionRole;
 use crate::transaction::make_tag;
 use crate::transport::SipAddr;
 use crate::{Error, Result};
+use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
+
+// Long enough to page an idle UE, short enough to leave room for the UDP fallback.
+const RELIABLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub type TransactionEventReceiver = UnboundedReceiver<TransactionEvent>;
 pub type TransactionEventSender = UnboundedSender<TransactionEvent>;
@@ -179,6 +183,8 @@ pub struct Transaction {
     pub timer_d: Option<u64>,
     pub timer_k: Option<u64>, // server invite only
     pub timer_g: Option<u64>, // server invite only
+    /// RFC 3261 §18.1.1: send requests larger than this over TCP rather than UDP when possible.
+    pub max_udp_request_size: Option<usize>,
     is_cleaned_up: bool,
 }
 
@@ -216,6 +222,7 @@ impl Transaction {
             timer_d: None,
             timer_k: None,
             timer_g: None,
+            max_udp_request_size: None,
             tu_receiver,
             tu_sender,
             is_cleaned_up: false,
@@ -287,7 +294,7 @@ impl Transaction {
             self.connection.replace(connection);
         }
 
-        let connection = self.connection.as_ref().ok_or(Error::TransactionError(
+        let connection = self.connection.clone().ok_or(Error::TransactionError(
             "no connection found".to_string(),
             self.key.clone(),
         ))?;
@@ -297,14 +304,72 @@ impl Transaction {
             .headers_mut()
             .unique_push(content_length_header);
 
-        let message = if let Some(ref inspector) = self.endpoint_inner.message_inspector {
-            inspector.before_send(self.original.to_owned().into(), self.destination.as_ref())
-        } else {
-            self.original.to_owned().into()
-        };
+        if !connection.is_reliable()
+            && self
+                .max_udp_request_size
+                .is_some_and(|limit| self.original.to_bytes().len() > limit)
+        {
+            match self.send_reliable().await {
+                Ok(()) => return self.transition(TransactionState::Calling).map(|_| ()),
+                Err(e) => {
+                    warn!(key = %self.key, error = %e, "TCP unavailable for large request, sending over UDP")
+                }
+            }
+        }
 
+        let message = self.prepare_outgoing(self.original.to_owned());
         connection.send(message, self.destination.as_ref()).await?;
         self.transition(TransactionState::Calling).map(|_| ())
+    }
+
+    fn prepare_outgoing(&self, request: Request) -> SipMessage {
+        match self.endpoint_inner.message_inspector {
+            Some(ref inspector) => inspector.before_send(request.into(), self.destination.as_ref()),
+            None => request.into(),
+        }
+    }
+
+    async fn send_reliable(&mut self) -> Result<()> {
+        let mut target = match &self.destination {
+            Some(addr) => addr.clone(),
+            None => SipAddr::try_from(&self.original.uri)?,
+        };
+        target.r#type = Some(Transport::Tcp);
+
+        let lookup = self
+            .endpoint_inner
+            .transport_layer
+            .lookup(&target, Some(&self.key));
+        let (connection, target) = tokio::time::timeout(RELIABLE_CONNECT_TIMEOUT, lookup)
+            .await
+            .map_err(|_| {
+                Error::TransportLayerError("TCP connect timed out".to_string(), target.clone())
+            })??;
+        if !connection.is_reliable() {
+            return Err(Error::TransportLayerError(
+                "no TCP connection to target".to_string(),
+                target,
+            ));
+        }
+
+        let mut request = self.original.clone();
+        request.via_header_mut()?.update_first_value(|via| {
+            let mut via = via.typed()?;
+            via.transport = Transport::Tcp;
+            Ok(via.into())
+        })?;
+
+        if let Err(e) = connection
+            .send(self.prepare_outgoing(request.clone()), None)
+            .await
+        {
+            self.endpoint_inner.transport_layer.del_connection(&target);
+            return Err(e);
+        }
+        debug!(key = %self.key, %target, "sent large request over TCP");
+        self.original = request;
+        self.connection = Some(connection);
+        Ok(())
     }
 
     pub async fn reply_with(
@@ -685,10 +750,8 @@ impl Transaction {
 
         self.transition(new_state).ok();
 
-        // In proxy mode we forward the UAC's own ACK end-to-end rather than generating one
-        // here (which would use the dialog route set — for a record-routing proxy that
-        // includes our own address, looping the ACK back).
-        if is_completed_client_invite && !self.endpoint_inner.option.proxy_mode {
+        let is_2xx = resp.status_code.kind() == StatusCodeKind::Successful;
+        if is_completed_client_invite && (!self.endpoint_inner.option.proxy_mode || !is_2xx) {
             self.send_ack(connection).await.ok();
         }
 

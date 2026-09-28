@@ -10,6 +10,7 @@ mod test_endpoint;
 mod test_provisional_responses;
 mod test_server;
 mod test_transaction_states;
+mod test_udp_size_limit;
 
 pub(super) async fn create_test_endpoint(addr: Option<&str>) -> Result<Endpoint> {
     let token = CancellationToken::new();
